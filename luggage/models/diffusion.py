@@ -18,6 +18,28 @@ def get_betas(num_timesteps, diffusion_schedule):
         return torch.clip(betas, 0, 0.999)
     else:
         raise ValueError(f"Invalid schedule: {diffusion_schedule}, must be 'linear' or 'cosine'")
+    
+def random_noise_function(batch, sigma):
+    batch_noise = batch.clone()
+    batch_noise.y = torch.normal(mean=0, std=sigma, size=batch_noise.y.shape)
+    return batch_noise
+
+def extract(values, indices, batch_idx):
+    """
+    Given one index value `i` for each of the 'batch_size' molecules,
+    extract the necessary values from the input array `values` corresponding to the indices 'i' in `indices`
+    and repeat them 'num_nodes' times for each molecule in the batch.
+
+    Parameters:
+    values (torch.Tensor): Array of shape (max(indices), 1) containing the values to extract from.
+    indices (torch.Tensor): Array of shape (batch_size, 1) containing the indices to extract.
+    batch_idx (torch.Tensor): Array of shape (batch_size * num_nodes, 1) containing the indices of the molecules.
+
+    Returns:
+    (torch.Tensor): Array of shape (batch_size * num_nodes, 1) containing the extracted values.
+    """
+    return torch.repeat_interleave(values[indices], torch.bincount(batch_idx)).reshape((len(batch_idx), 1))
+
 
 class SinusoidalPositionEmbeddings(torch.nn.Module):
     def __init__(self, dim):
@@ -49,64 +71,130 @@ class DiffusionDenoiser(pl.LightningModule):
 
 class Diffusion(pl.LightningModule):
     def __init__(self, model: ty.Union[pl.LightningModule, torch.nn.Module],
-                 modify_graph_function: ty.Callable[[Data, torch.Tensor], Data], 
-                 noise_function = lambda x: torch.rand_like(x), 
-                 num_timesteps: int = 1000,
+                 modify_graph_function: ty.Callable[[Data, torch.Tensor], Data],
+                 noise_function: ty.Callable[[Data, torch.Tensor], Data],
+                 diffusion_type: str = 'discrete',
                  loss_function = torch.nn.MSELoss(), 
                  time_dimension = 32, 
-                 diffusion_schedule="linear"):
+                 diffusion_schedule="linear",
+                 num_timesteps: int = 1000,
+                 min_sigma: float=0.,
+                 max_sigma: float=10.):
         super().__init__()
         self.save_hyperparameters()
         self.model = DiffusionDenoiser(model, time_dimension=time_dimension)
-        self.make_diffusion_variables(num_timesteps, diffusion_schedule)
         self.modify_graph_function = modify_graph_function
         self.noise_function = noise_function
-        self.num_timesteps = num_timesteps
         self.loss_function = loss_function
         
+        if diffusion_type == 'discrete':
+            self.num_timesteps = num_timesteps
+            self.diffusion_schedule = diffusion_schedule
+            self.betas = get_betas(num_timesteps, diffusion_schedule)
+            self.alphas = 1. - self.betas
+            self.alphas_cumprod = torch.cumprod(self.alphas, 0)
+            self.alphas_cumprod_prev = torch.cat([torch.Tensor([1.]), self.alphas_cumprod[:-1]])
+            self.sqrt_alphas = torch.sqrt(self.alphas)
+            self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+            self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+            self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+        elif diffusion_type == 'continuous':
+            self.min_sigma = min_sigma
+            self.max_sigma = max_sigma
+        self.diffusion_type = diffusion_type
+
         self.validation_step_outputs = []
 
-    def make_diffusion_variables(self, num_timesteps, diffusion_schedule):
-        self.betas = get_betas(num_timesteps, diffusion_schedule)
-        self.alphas = 1. - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, 0)
-        self.alphas_cumprod_prev = torch.cat([torch.Tensor([1.]), self.alphas_cumprod[:-1]])
-        self.sqrt_alphas = torch.sqrt(self.alphas)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
-        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-
-    @staticmethod
-    def extract(a, t, batch_idx):
+    def diffuse_one_step(self, batch, timesteps) -> ty.Tuple[Data, torch.Tensor]:
+        if self.diffusion_type == 'discrete':
+            batch_noise = self.noise_function(batch, 1.)
+            y_new = extract(self.sqrt_alphas_cumprod, timesteps, batch.batch) * batch.y + extract(self.sqrt_one_minus_alphas_cumprod, timesteps, batch.batch) * batch_noise.y
+            batch_new = self.modify_graph_function(batch.clone(), y_new)
+            return batch_new, batch_noise.y
+        else:
+            timesteps = extract(timesteps, torch.arange(len(batch)), batch.batch)
+            sigma = self.get_sigma(timesteps)
+            batch_noise = self.noise_function(batch, sigma)
+            y_noise = -batch_noise.y / sigma**2  
+            y_new = batch.y + batch_noise.y
+            batch_new = self.modify_graph_function(batch.clone(), y_new)
+            return batch_new, y_noise
+        
+    def sample_timesteps(self, num_samples):
         """
-        Extract the necessary values from the input array 'a' corresponding to the time steps 't'
-        for each molecule in 'batch_idx'.
-
-        Returns:
-        (torch.Tensor): Array of shape (batch_size * num_nodes, 1) containing the extracted values.
+        Returns a tensor of random timesteps.
         """
-        return torch.repeat_interleave(a[t], torch.bincount(batch_idx)).reshape((len(batch_idx), 1))
-
+        if self.diffusion_type == 'discrete':
+            return torch.randint(0, self.num_timesteps, size=(num_samples,)).to(self.device)
+        else:
+            return torch.rand(size=(num_samples,)).to(self.device)
+    
+    def get_sigma(self, time):
+        sigma = self.min_sigma ** (1-time) * self.max_sigma ** time
+        return sigma
+        
     def forward(self, node_features, edge_index, batch, timesteps):
         # predicted noise
         return self.model(node_features, edge_index, batch, timesteps)
     
-    def get_mean_loss(self, batch, batch_idx):
+    def diffuse_and_get_loss(self, batch, batch_idx):
         timesteps = self.sample_timesteps(len(batch))
-        data_sample, noise = self.diffuse_one_step(batch, timesteps)
-        predicted_noise = self(data_sample.x, data_sample.edge_index, data_sample.batch, timesteps)
-        loss = self.loss_function(predicted_noise, noise)
-        return loss
+        batch_new, y_noise = self.diffuse_one_step(batch, timesteps)
+        y_pred_noise = self(batch_new.x, batch_new.edge_index, batch_new.batch, timesteps)
+        return self.loss_function(y_pred_noise, y_noise)
+    
+    @torch.no_grad()
+    def reverse_diffuse_one_step(self, batch, timestep, dt):
+        timesteps = torch.full((len(batch),), timestep, dtype=torch.long, device=self.device)
+        if self.diffusion_type == 'discrete':
+            sqrt_recip_alphas_t = extract((1. / self.sqrt_alphas), timesteps, batch.batch)
+            sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, timesteps, batch.batch)
+            betas_t = extract(self.betas, timesteps, batch.batch)
+            w_noise = betas_t / sqrt_one_minus_alphas_cumprod_t
+            # Use our model (noise predictor) to predict the mean noise
+            y_pred_noise = self(batch.x, batch.edge_index, batch.batch, timestep)
+            y_pred = sqrt_recip_alphas_t * (batch.y - w_noise * y_pred_noise)
+            batch = self.modify_graph_function(batch, y_pred)
+            if timestep[0] != 0:
+                posterior_variance_t = extract(self.posterior_variance, timesteps, batch.batch)
+                batch_noise = self.noise_function(batch, 1.)
+                y_pred = batch.y + posterior_variance_t * batch_noise.y
+                batch = self.modify_graph_function(batch, y_pred)
+            return batch
+        else:
+            y_pred_noise = self(batch.x, batch.edge_index, batch.batch, timesteps)
+            sigma = self.get_sigma(timestep)
+            gradient = sigma * torch.sqrt(torch.tensor(2 * np.log(self.max_sigma / self.min_sigma)))
+            batch_noise = self.noise_function(batch, 1.)
+            y_pred = gradient ** 2 * dt * y_pred_noise + gradient * torch.sqrt(dt) * batch_noise.y
+            batch = self.modify_graph_function(batch, y_pred)
+        return batch
+
+    @torch.no_grad()
+    def reverse_diffuse(self, batch, noise=True, steps=1000):
+        if noise:
+            # start from pure noise (for each example in the batch)
+            batch = self.noise_function(batch, self.max_sigma)
+        y_preds = []
+        if self.diffusion_type == 'discrete':
+            timesteps = np.linspace(0, self.num_timesteps, steps)[::-1]
+        else:
+            timesteps = np.linspace(0, 1, steps)[::-1]
+        for t in range(1, len(timesteps)):
+            dt = timesteps[t] - timesteps[t-1]
+            batch = self.reverse_diffuse_one_step(batch, timesteps[t], dt)
+            y_preds.append(batch.y.detach())
+        return y_preds
     
     def training_step(self, batch, batch_idx):
-        loss = self.get_mean_loss(batch, batch_idx)
+        loss = self.diffuse_and_get_loss(batch, batch_idx)
         self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True,
                  batch_size=len(batch))
         return loss
     
     def validation_step(self, batch, batch_idx):
-        loss = self.get_mean_loss(batch, batch_idx)
-        y_pred = self.reverse_diffuse(batch.clone(), linspace=self.num_timesteps)[-1]
+        loss = self.diffuse_and_get_loss(batch, batch_idx)
+        y_pred = self.reverse_diffuse(batch.clone(), steps=1000)[-1]
         loss_inference = self.loss_function(y_pred, batch.y)
         self.log('val_loss', loss, on_step=True, on_epoch=True,
                  sync_dist=True, batch_size=batch.x.shape[0])
@@ -116,54 +204,3 @@ class Diffusion(pl.LightningModule):
                                                  y_true=batch.y, 
                                                  y_pred=y_pred))
         return loss
-
-    def sample_timesteps(self, num_samples):
-        """
-        Returns a tensor of random timesteps.
-        """
-        return torch.randint(0, self.num_timesteps, size=(num_samples,)).to(self.device)
-    
-    
-    def diffuse_one_step(self, data, timestep) -> ty.Tuple[Data, torch.Tensor]:
-        """
-        Sample with noise
-        Returns:
-            Tuple[Data, Tensor]: A tuple containing the noised graph and the noise added to it.
-        """
-        noise = self.noise_function(data.y)
-        y_noise = self.extract(self.sqrt_alphas_cumprod, timestep, data.batch) * data.y + self.extract(self.sqrt_one_minus_alphas_cumprod, timestep, data.batch) * noise
-        data_sample = self.modify_graph_function(data.clone(), y_noise)
-        return data_sample, noise
-
-    @torch.no_grad()
-    def reverse_diffuse_one_step(self, data, timestep):
-        sqrt_recip_alphas_t = self.extract((1. / self.sqrt_alphas), timestep, data.batch)
-        sqrt_one_minus_alphas_cumprod_t = self.extract(self.sqrt_one_minus_alphas_cumprod, timestep, data.batch)
-        betas_t = self.extract(self.betas, timestep, data.batch)
-        w_noise = betas_t / sqrt_one_minus_alphas_cumprod_t
-        # Use our model (noise predictor) to predict the mean noise
-        y_pred_noise = self.model(data.x, data.edge_index, data.batch, timestep)
-        y_pred = sqrt_recip_alphas_t * (data.y - w_noise * y_pred_noise)
-        data = self.modify_graph_function(data, y_pred)
-        if timestep[0] != 0:
-            posterior_variance_t = self.extract(self.posterior_variance, timestep, data.batch)
-            noise = self.noise_function(data.y)
-            y_pred = data.y + posterior_variance_t * noise
-            data = self.modify_graph_function(data, y_pred)
-        return data
-
-    @torch.no_grad()
-    def reverse_diffuse(self, batch, noise=True, linspace=1000, start_timestep=None):
-        if start_timestep is None:
-            start_timestep = self.num_timesteps - 1
-        start_timestep = min(start_timestep, self.num_timesteps - 1)
-        linspace = min(linspace, start_timestep)
-        if noise:
-            # start from pure noise (for each example in the batch)
-            batch.y = self.noise_function(batch.y)
-        y_preds = []
-        for timestep in reversed(np.linspace(0, start_timestep, linspace).astype(int)):
-            timesteps = torch.full((len(batch),), timestep).to(self.device)
-            batch = self.reverse_diffuse_one_step(batch, timesteps)
-            y_preds.append(batch.y.detach())
-        return y_preds
