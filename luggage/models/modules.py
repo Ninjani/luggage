@@ -3,6 +3,7 @@ import torch
 from torch_geometric.nn import HeteroConv
 from torch_geometric.nn.conv import hetero_conv
 from torch import nn
+import math
 
 
 # Taken from HeteroConv in torch_geometric.nn.conv
